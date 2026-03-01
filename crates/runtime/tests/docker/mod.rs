@@ -28,9 +28,10 @@ use bollard::{
     },
     exec::{CreateExecOptions, StartExecResults},
     image::CreateImageOptions,
+    network::CreateNetworkOptions,
     secret::{
-        ContainerState, ContainerStateStatusEnum, Health, HealthConfig, HealthStatusEnum,
-        HostConfig, PortBinding,
+        ContainerState, ContainerStateStatusEnum, EndpointSettings, Health, HealthConfig,
+        HealthStatusEnum, HostConfig, PortBinding,
     },
 };
 
@@ -134,6 +135,9 @@ pub struct ContainerRunnerBuilder<'a> {
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
     command: Option<Vec<String>>,
+    network: Option<String>,
+    host_network: bool,
+    tmpfs_mounts: Vec<String>,
 }
 
 impl<'a> ContainerRunnerBuilder<'a> {
@@ -145,6 +149,9 @@ impl<'a> ContainerRunnerBuilder<'a> {
             env_vars: Vec::new(),
             healthcheck: None,
             command: None,
+            network: None,
+            host_network: false,
+            tmpfs_mounts: Vec::new(),
         }
     }
 
@@ -158,7 +165,6 @@ impl<'a> ContainerRunnerBuilder<'a> {
         self
     }
 
-    #[expect(dead_code)]
     pub fn add_env_var(mut self, key: &str, value: &str) -> Self {
         self.env_vars.push((key.to_string(), value.to_string()));
         self
@@ -178,6 +184,30 @@ impl<'a> ContainerRunnerBuilder<'a> {
         self
     }
 
+    /// Attach container to a named Docker/Podman network for
+    /// inter-container DNS resolution.
+    #[expect(dead_code)]
+    pub fn network(mut self, network: &str) -> Self {
+        self.network = Some(network.to_string());
+        self
+    }
+
+    /// Use host networking mode — container shares the host's network
+    /// namespace. Port bindings are ignored (services bind directly to
+    /// host ports). This avoids needing custom bridge networks.
+    pub fn host_network(mut self) -> Self {
+        self.host_network = true;
+        self
+    }
+
+    /// Mount a tmpfs at the given container path. Use this to override
+    /// image-defined VOLUMEs, preventing anonymous volume creation
+    /// (works around a podman API bug where `_data` dirs are missing).
+    pub fn add_tmpfs(mut self, path: &str) -> Self {
+        self.tmpfs_mounts.push(path.to_string());
+        self
+    }
+
     pub fn build(self) -> Result<ContainerRunner<'a>, anyhow::Error> {
         let image = self
             .image
@@ -190,6 +220,9 @@ impl<'a> ContainerRunnerBuilder<'a> {
             env_vars: self.env_vars,
             healthcheck: self.healthcheck,
             command: self.command,
+            network: self.network,
+            host_network: self.host_network,
+            tmpfs_mounts: self.tmpfs_mounts,
         })
     }
 }
@@ -202,6 +235,9 @@ pub struct ContainerRunner<'a> {
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
     command: Option<Vec<String>>,
+    network: Option<String>,
+    host_network: bool,
+    tmpfs_mounts: Vec<String>,
 }
 
 impl<'a> ContainerRunner<'a> {
@@ -253,9 +289,29 @@ impl<'a> ContainerRunner<'a> {
             (Some(exposed_ports), Some(port_bindings_map))
         };
 
-        let host_config = Some(HostConfig {
-            port_bindings,
-            ..Default::default()
+        let tmpfs = if self.tmpfs_mounts.is_empty() {
+            None
+        } else {
+            Some(
+                self.tmpfs_mounts
+                    .iter()
+                    .map(|p| (p.clone(), String::new()))
+                    .collect::<HashMap<String, String>>(),
+            )
+        };
+
+        let host_config = Some(if self.host_network {
+            HostConfig {
+                network_mode: Some("host".to_string()),
+                tmpfs: tmpfs.clone(),
+                ..Default::default()
+            }
+        } else {
+            HostConfig {
+                port_bindings,
+                tmpfs,
+                ..Default::default()
+            }
         });
 
         let env_vars: Vec<String> = self
@@ -265,12 +321,25 @@ impl<'a> ContainerRunner<'a> {
             .collect();
         let env_vars_str = env_vars.iter().map(String::as_str).collect::<Vec<&str>>();
 
+        let networking_config = self.network.as_ref().map(|net| {
+            bollard::container::NetworkingConfig {
+                endpoints_config: HashMap::from([(
+                    net.as_str(),
+                    EndpointSettings {
+                        ..Default::default()
+                    },
+                )]),
+            }
+        });
+
+        let has_healthcheck = self.healthcheck.is_some();
         let config = Config::<&str> {
             image: Some(&self.image),
             env: Some(env_vars_str),
             host_config,
             healthcheck: self.healthcheck,
             exposed_ports,
+            networking_config,
             cmd: self
                 .command
                 .as_ref()
@@ -290,18 +359,30 @@ impl<'a> ContainerRunner<'a> {
             let inspect_container = self.docker.inspect_container(self.name, None).await?;
             tracing::trace!("Container status: {:?}", inspect_container.state);
 
-            if let Some(ContainerState {
-                status: Some(ContainerStateStatusEnum::RUNNING),
-                health:
-                    Some(Health {
-                        status: Some(HealthStatusEnum::HEALTHY),
-                        ..
-                    }),
-                ..
-            }) = inspect_container.state
-            {
-                tracing::debug!("Container running & healthy");
-                break;
+            match inspect_container.state {
+                // Container is running and healthcheck reports healthy
+                Some(ContainerState {
+                    status: Some(ContainerStateStatusEnum::RUNNING),
+                    health:
+                        Some(Health {
+                            status: Some(HealthStatusEnum::HEALTHY),
+                            ..
+                        }),
+                    ..
+                }) => {
+                    tracing::debug!("Container running & healthy");
+                    break;
+                }
+                // Container is running with no healthcheck configured — accept immediately
+                Some(ContainerState {
+                    status: Some(ContainerStateStatusEnum::RUNNING),
+                    health: None,
+                    ..
+                }) if !has_healthcheck => {
+                    tracing::debug!("Container running (no healthcheck)");
+                    break;
+                }
+                _ => {}
             }
 
             if start_time.elapsed() > start_timeout {
@@ -381,4 +462,43 @@ pub async fn is_docker_available() -> bool {
 
     // Try to ping the Docker daemon to verify it's actually running
     docker.ping().await.is_ok()
+}
+
+/// Create a Docker/Podman network for inter-container communication.
+///
+/// If a network with the same name already exists, it is removed and re-created.
+/// If removal fails (e.g., containers still attached), the existing network is reused.
+#[expect(dead_code)]
+pub async fn create_network(name: &str) -> Result<(), anyhow::Error> {
+    let docker = Docker::connect_with_local_defaults()?;
+
+    // Remove existing network if present (ignore errors)
+    let _ = docker.remove_network(name).await;
+
+    match docker
+        .create_network(CreateNetworkOptions::<&str> {
+            name,
+            driver: "bridge",
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409, ..
+        }) => {
+            // Network already exists (couldn't remove due to attached containers) — reuse it
+            tracing::debug!("Network {name} already exists, reusing");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Remove a Docker/Podman network.
+#[expect(dead_code)]
+pub async fn remove_network(name: &str) -> Result<(), anyhow::Error> {
+    let docker = Docker::connect_with_local_defaults()?;
+    docker.remove_network(name).await?;
+    Ok(())
 }

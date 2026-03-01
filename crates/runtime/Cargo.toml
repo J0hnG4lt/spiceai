@@ -61,6 +61,7 @@ duckdb = { workspace = true, features = [
 ], optional = true }
 dynamodb-streams = { path = "../dynamodb-streams", optional = true }
 event_stream = { path = "../event_stream" }
+fluss = { workspace = true, optional = true }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true
@@ -280,6 +281,7 @@ flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
 iceberg-write = []
 imap = ["data_components/imap"]
+fluss = ["dep:fluss", "data_components/fluss"]
 kafka = ["data_components/kafka"]
 keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
 mcp = ["dep:rmcp", "tools/mcp"]

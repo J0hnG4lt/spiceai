@@ -1,0 +1,12 @@
+---
+source: crates/runtime/tests/fluss/mod.rs
+expression: formatted
+---
++-------------+-----------+-------------+
+| column_name | data_type | is_nullable |
++-------------+-----------+-------------+
+| order_id    | Int32     | YES         |
+| product     | Utf8      | YES         |
+| quantity    | Int32     | YES         |
+| price       | Float32   | YES         |
++-------------+-----------+-------------+

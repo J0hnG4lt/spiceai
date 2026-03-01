@@ -40,6 +40,8 @@ pub mod dynamodb;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+#[cfg(feature = "fluss")]
+pub mod fluss;
 pub mod iceberg;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;

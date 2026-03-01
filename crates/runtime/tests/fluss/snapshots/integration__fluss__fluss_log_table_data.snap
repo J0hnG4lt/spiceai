@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/fluss/mod.rs
+expression: formatted
+---
++----------+----------+----------+-------+
+| order_id | product  | quantity | price |
++----------+----------+----------+-------+
+| 1        | Widget A | 10       | 9.99  |
+| 2        | Widget B | 5        | 19.99 |
+| 3        | Gadget C | 3        | 49.99 |
+| 4        | Widget A | 7        | 9.99  |
+| 5        | Gadget D | 1        | 99.99 |
++----------+----------+----------+-------+

@@ -71,6 +71,7 @@ opendal = "0.55"
 oracle = { version = "0.6", optional = true }
 rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
+fluss = { workspace = true, optional = true }
 regex.workspace = true
 reqwest.workspace = true
 runtime-rate-control = { path = "../runtime-rate-control" }
@@ -133,6 +134,7 @@ dynamodb = [
 ]
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
+fluss = ["dep:fluss"]
 kafka = ["dep:rdkafka"]
 mongodb = ["datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]

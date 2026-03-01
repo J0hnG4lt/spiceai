@@ -68,6 +68,8 @@ mod graphql;
 mod iceberg;
 mod iceberg_api;
 
+#[cfg(feature = "fluss")]
+mod fluss;
 #[cfg(feature = "kafka")]
 mod kafka;
 mod metadata;

@@ -157,6 +157,8 @@ pub mod file;
 pub mod git;
 pub mod github;
 pub mod https;
+#[cfg(feature = "fluss")]
+pub mod fluss;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod localpod;

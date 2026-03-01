@@ -81,6 +81,9 @@ pub mod kafka;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 
+#[cfg(feature = "fluss")]
+pub mod fluss;
+
 pub mod caching_engine;
 
 enum AccelerationConnection {

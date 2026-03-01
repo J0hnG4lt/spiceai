@@ -93,6 +93,7 @@ default = [
     "sftp",
     "debezium",
     "kafka",
+    "fluss",
     "anonymous_telemetry",
     "mssql",
     "dynamodb",
@@ -117,6 +118,7 @@ flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]
 iceberg-write = ["runtime/iceberg-write"]
 imap = ["connector-imap", "runtime/imap"]
+fluss = ["runtime/fluss"]
 kafka = ["runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
