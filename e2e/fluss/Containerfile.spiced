@@ -1,0 +1,43 @@
+# Builds spiced with the Fluss connector for the E2E suite.
+#
+# Build from the REPO ROOT so the whole workspace is in context:
+#   podman build -f e2e/fluss/Containerfile.spiced -t localhost/spiced-fluss:dev .
+#
+# Uses cache mounts so iterative builds only recompile changed crates.
+# Debug profile: fast(er) to build; query volumes in the E2E suite are tiny.
+
+FROM docker.io/library/rust:1-bookworm AS build
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+       pkg-config libssl-dev cmake protobuf-compiler libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+
+RUN --mount=type=cache,id=spiced-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=spiced-gitdb,target=/usr/local/cargo/git \
+    --mount=type=cache,id=spiced-target,target=/build/target \
+    cargo build -p spiced --no-default-features --features duckdb,flightsql \
+    && cp /build/target/debug/spiced /usr/local/bin/spiced
+
+FROM docker.io/library/debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates libssl3 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/local/bin/spiced /usr/local/bin/spiced
+
+# The spicepod is baked into the image; the .spice state dir (acceleration
+# files + checkpoint sidecars) is a named volume so restarts/recreates keep it.
+COPY e2e/fluss/spicepod /app
+
+WORKDIR /app
+ENV HOME=/app
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+EXPOSE 8090 50051
+
+ENTRYPOINT ["/usr/local/bin/spiced"]
