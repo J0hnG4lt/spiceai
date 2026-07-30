@@ -25,6 +25,7 @@ connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", opt
 connector-ducklake = { path = "../../crates/data-connectors/connector-ducklake" }
 connector-elasticsearch = { path = "../../crates/data-connectors/connector-elasticsearch", optional = true }
 connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql", optional = true }
+connector-fluss = { path = "../../crates/data-connectors/connector-fluss" }
 connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional = true }
 connector-gcs = { path = "../../crates/data-connectors/connector-gcs" }
 connector-git = { path = "../../crates/data-connectors/connector-git" }
