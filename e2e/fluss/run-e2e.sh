@@ -27,8 +27,13 @@ export MSYS_NO_PATHCONV=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/podman-compose.yaml"
+# podman-compose on Windows is a native Python process — hand it a Windows
+# path, not the MSYS /c/... form.
+if command -v cygpath > /dev/null 2>&1; then
+  COMPOSE_FILE="$(cygpath -m "${COMPOSE_FILE}")"
+fi
 
-SPICE_HTTP="${SPICE_HTTP:-http://localhost:8090}"
+SPICE_HTTP="${SPICE_HTTP:-http://localhost:18090}"
 BOOTSTRAP="${FLUSS_BOOTSTRAP_SERVERS:-localhost:9123}"
 CURL_IMAGE="docker.io/curlimages/curl:8.5.0"
 PRODUCER_IMAGE="localhost/fluss-producer:dev"

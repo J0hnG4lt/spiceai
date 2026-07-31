@@ -78,6 +78,13 @@ services:
     image: localhost/spiced-fluss:dev
     container_name: spiced-fluss
     network_mode: host
+    # Non-default ports so the suite coexists with any other spiced on the
+    # machine (host networking shares one port namespace).
+    command:
+      - "--http"
+      - "127.0.0.1:${SPICE_HTTP_PORT:-18090}"
+      - "--flight"
+      - "127.0.0.1:${SPICE_FLIGHT_PORT:-15051}"
     volumes:
       # Acceleration files + checkpoint sidecars must survive container
       # restarts and recreation for the resume scenarios.
