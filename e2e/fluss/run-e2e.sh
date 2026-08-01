@@ -302,7 +302,7 @@ s6_tablet_fault() {
 
   sleep 8
   log "s6 restarting tablet-server-0..."
-  podman restart fluss-tablet-server-0 || { fail "s6 tablet restart"; return; }
+  podman restart -t 30 fluss-tablet-server-0 || { fail "s6 tablet restart"; return; }
 
   podman wait fluss-mixed > /dev/null 2>&1
   local appended
@@ -336,7 +336,7 @@ s7_chaos() {
 
   sleep 3
   log "s7 restarting tablet-server-1..."
-  podman restart fluss-tablet-server-1 || { fail "s7 tablet restart"; return; }
+  podman restart -t 30 fluss-tablet-server-1 || { fail "s7 tablet restart"; return; }
 
   podman wait fluss-mixed > /dev/null 2>&1
   local appended

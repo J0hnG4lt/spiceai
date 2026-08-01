@@ -405,8 +405,8 @@ impl DataConnector for Fluss {
             };
 
             let mut changes_stream = match stream::stream_log_table(
-                fluss_provider.connection(),
-                fluss_provider.table_path(),
+                Arc::clone(fluss_provider.connection()),
+                fluss_provider.table_path().clone(),
                 metrics,
                 initial_offsets,
                 committer_factory,
@@ -448,8 +448,8 @@ impl DataConnector for Fluss {
             let (initial_offsets, committer_factory) = initialize_checkpoint(&dataset).await;
 
             let mut changes_stream = match stream::stream_cdc_table(
-                fluss_provider.connection(),
-                fluss_provider.table_path(),
+                Arc::clone(fluss_provider.connection()),
+                fluss_provider.table_path().clone(),
                 metrics,
                 initial_offsets,
                 committer_factory,

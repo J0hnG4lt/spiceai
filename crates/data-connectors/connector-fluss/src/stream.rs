@@ -41,7 +41,7 @@ use arrow::datatypes::{DataType, Field, SchemaRef};
 use async_stream::stream;
 use data_components::cdc::{self, ChangeBatch, ChangesStream, CommitChange};
 use fluss::PartitionId;
-use fluss::client::{EARLIEST_OFFSET, FlussConnection};
+use fluss::client::{EARLIEST_OFFSET, FlussConnection, LogScanner, RecordBatchLogScanner};
 use fluss::metadata::TablePath;
 use fluss::record::ChangeType;
 use fluss::rpc::message::OffsetSpec;
@@ -62,12 +62,25 @@ pub type CommitterFactory =
 /// Default poll timeout for the Fluss log scanner.
 const POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Pause after a poll error before polling again, so a persistent server-side
+/// failure surfaces as one error per second instead of a hot loop.
+const ERROR_BACKOFF: Duration = Duration::from_secs(1);
+
 /// Wrap a Fluss client error into the connector-agnostic CDC stream error.
 fn fluss_err(e: fluss::error::Error) -> cdc::StreamError {
     cdc::StreamError::Connector {
         connector: "fluss",
         source: Box::new(e),
     }
+}
+
+/// Whether the error means our subscription offset points past the log
+/// segments the server still has (`LogOffsetOutOfRangeException`) — e.g. a
+/// tablet server lost its unflushed tail, truncating the log under our
+/// checkpoint. Matched on the message: the client surfaces server API errors
+/// as strings.
+fn is_offset_out_of_range(e: &fluss::error::Error) -> bool {
+    e.to_string().contains("out of range")
 }
 
 /// Create a committer — either from the factory or a no-op fallback.
@@ -174,16 +187,101 @@ fn seed_consumed(initial_offsets: Option<&HashMap<OffsetKey, i64>>) -> HashMap<O
     initial_offsets.cloned().unwrap_or_default()
 }
 
+/// Recovery for an append stream whose checkpoint points past the segments the
+/// server still has: appended rows cannot be replayed without duplicating the
+/// whole table, so rejoin at the live tail. The lost range is gone at the
+/// source; the caller logs the gap loudly.
+async fn resubscribe_log_tail(
+    connection: &FlussConnection,
+    table_path: &TablePath,
+    num_buckets: i32,
+    is_partitioned: bool,
+) -> Result<RecordBatchLogScanner, cdc::StreamError> {
+    let admin = connection.get_admin().map_err(fluss_err)?;
+    let bucket_ids: Vec<i32> = (0..num_buckets).collect();
+    let table = connection.get_table(table_path).await.map_err(fluss_err)?;
+    let scanner = table
+        .new_scan()
+        .create_record_batch_log_scanner()
+        .map_err(fluss_err)?;
+
+    if is_partitioned {
+        let partitions = admin
+            .list_partition_infos(table_path)
+            .await
+            .map_err(fluss_err)?;
+        let mut offsets: HashMap<(PartitionId, i32), i64> = HashMap::new();
+        for partition_info in &partitions {
+            let partition_name = partition_info.get_partition_name();
+            let latest = admin
+                .list_partition_offsets(table_path, &partition_name, &bucket_ids, OffsetSpec::Latest)
+                .await
+                .map_err(fluss_err)?;
+            for (bucket, offset) in latest {
+                offsets.insert((partition_info.get_partition_id(), bucket), offset);
+            }
+        }
+        scanner
+            .subscribe_partition_buckets(&offsets)
+            .await
+            .map_err(fluss_err)?;
+    } else {
+        let latest = admin
+            .list_offsets(table_path, &bucket_ids, OffsetSpec::Latest)
+            .await
+            .map_err(fluss_err)?;
+        scanner.subscribe_buckets(&latest).await.map_err(fluss_err)?;
+    }
+    Ok(scanner)
+}
+
+/// Recovery for a CDC stream whose checkpoint points past the surviving log
+/// segments: replay the whole changelog from `EARLIEST_OFFSET`. PK operations
+/// are idempotent upserts/deletes, so the replay converges the accelerator to
+/// the source's current state.
+async fn resubscribe_cdc_earliest(
+    connection: &FlussConnection,
+    table_path: &TablePath,
+    num_buckets: i32,
+    is_partitioned: bool,
+) -> Result<LogScanner, cdc::StreamError> {
+    let table = connection.get_table(table_path).await.map_err(fluss_err)?;
+    let scanner = table.new_scan().create_log_scanner().map_err(fluss_err)?;
+
+    if is_partitioned {
+        let admin = connection.get_admin().map_err(fluss_err)?;
+        let partitions = admin
+            .list_partition_infos(table_path)
+            .await
+            .map_err(fluss_err)?;
+        let mut offsets: HashMap<(PartitionId, i32), i64> = HashMap::new();
+        for partition_info in &partitions {
+            for bucket in 0..num_buckets {
+                offsets.insert((partition_info.get_partition_id(), bucket), EARLIEST_OFFSET);
+            }
+        }
+        scanner
+            .subscribe_partition_buckets(&offsets)
+            .await
+            .map_err(fluss_err)?;
+    } else {
+        let offsets: HashMap<i32, i64> =
+            (0..num_buckets).map(|b| (b, EARLIEST_OFFSET)).collect();
+        scanner.subscribe_buckets(&offsets).await.map_err(fluss_err)?;
+    }
+    Ok(scanner)
+}
+
 /// Create a `ChangesStream` that polls a Fluss log table for new records
 /// (append mode — every record is a "create").
 pub async fn stream_log_table(
-    connection: &FlussConnection,
-    table_path: &TablePath,
+    connection: Arc<FlussConnection>,
+    table_path: TablePath,
     metrics: Arc<FlussMetrics>,
     initial_offsets: Option<HashMap<OffsetKey, i64>>,
     committer_factory: Option<CommitterFactory>,
 ) -> Result<ChangesStream, cdc::StreamError> {
-    let table = connection.get_table(table_path).await.map_err(fluss_err)?;
+    let table = connection.get_table(&table_path).await.map_err(fluss_err)?;
     let table_info = table.get_table_info();
     let schema: SchemaRef = fluss::record::to_arrow_schema(table_info.row_type())
         .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
@@ -192,18 +290,20 @@ pub async fn stream_log_table(
     let is_partitioned = table_info.is_partitioned();
 
     let (high_watermarks, bucket_offsets, partition_bucket_offsets) = prepare_subscription(
-        connection,
-        table_path,
+        &connection,
+        &table_path,
         num_buckets,
         is_partitioned,
         initial_offsets.as_ref(),
     )
     .await?;
 
-    let scanner = table
+    let mut scanner = table
         .new_scan()
         .create_record_batch_log_scanner()
         .map_err(fluss_err)?;
+    // `table` borrows `connection`, which moves into the generator below.
+    drop(table);
 
     if is_partitioned {
         scanner
@@ -223,12 +323,35 @@ pub async fn stream_log_table(
     let stream = stream! {
         let mut is_ready = starts_ready;
 
+        // A stream that starts caught up (empty table, or a resume whose
+        // checkpoint already covers the watermarks) would otherwise emit no
+        // envelope until new data arrives — leaving the dataset NotReady and
+        // unqueryable indefinitely. Announce readiness up front.
+        if is_ready {
+            match cdc::build_ready_signal_envelope(&schema) {
+                Ok(envelope) => yield Ok(envelope),
+                Err(e) => yield Err(e.into()),
+            }
+        }
+
         loop {
             let batches = match scanner.poll(POLL_TIMEOUT).await {
                 Ok(batches) => batches,
                 Err(e) => {
                     metrics.inc_poll_errors();
+                    let out_of_range = is_offset_out_of_range(&e);
                     yield Err(fluss_err(e));
+                    tokio::time::sleep(ERROR_BACKOFF).await;
+                    if out_of_range {
+                        tracing::warn!(
+                            table = %table_path,
+                            "Fluss log segments were truncated past the checkpoint (source-side data loss); rejoining at the live tail — rows in the lost range cannot be recovered"
+                        );
+                        match resubscribe_log_tail(&connection, &table_path, num_buckets, is_partitioned).await {
+                            Ok(new_scanner) => scanner = new_scanner,
+                            Err(e2) => yield Err(e2),
+                        }
+                    }
                     continue;
                 }
             };
@@ -393,13 +516,13 @@ fn build_cdc_change_batch(
 /// changelog retention (`table.log.ttl`) to cover its history. Resume uses the
 /// per-bucket offsets persisted by the envelope committers.
 pub async fn stream_cdc_table(
-    connection: &FlussConnection,
-    table_path: &TablePath,
+    connection: Arc<FlussConnection>,
+    table_path: TablePath,
     metrics: Arc<FlussMetrics>,
     initial_offsets: Option<HashMap<OffsetKey, i64>>,
     committer_factory: Option<CommitterFactory>,
 ) -> Result<ChangesStream, cdc::StreamError> {
-    let table = connection.get_table(table_path).await.map_err(fluss_err)?;
+    let table = connection.get_table(&table_path).await.map_err(fluss_err)?;
     let table_info = table.get_table_info();
     let schema: SchemaRef = fluss::record::to_arrow_schema(table_info.row_type())
         .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
@@ -410,15 +533,17 @@ pub async fn stream_cdc_table(
     let is_partitioned = table_info.is_partitioned();
 
     let (high_watermarks, bucket_offsets, partition_bucket_offsets) = prepare_subscription(
-        connection,
-        table_path,
+        &connection,
+        &table_path,
         num_buckets,
         is_partitioned,
         initial_offsets.as_ref(),
     )
     .await?;
 
-    let scanner = table.new_scan().create_log_scanner().map_err(fluss_err)?;
+    let mut scanner = table.new_scan().create_log_scanner().map_err(fluss_err)?;
+    // `table` borrows `connection`, which moves into the generator below.
+    drop(table);
 
     if is_partitioned {
         scanner
@@ -438,12 +563,37 @@ pub async fn stream_cdc_table(
     let stream = stream! {
         let mut is_ready = starts_ready;
 
+        // Same up-front readiness announcement as the log path: an idle
+        // resume or empty table must not leave the dataset NotReady.
+        if is_ready {
+            match cdc::build_ready_signal_envelope(&schema) {
+                Ok(envelope) => yield Ok(envelope),
+                Err(e) => yield Err(e.into()),
+            }
+        }
+
         loop {
             let scan_records = match scanner.poll(POLL_TIMEOUT).await {
                 Ok(records) => records,
                 Err(e) => {
                     metrics.inc_poll_errors();
+                    let out_of_range = is_offset_out_of_range(&e);
                     yield Err(fluss_err(e));
+                    tokio::time::sleep(ERROR_BACKOFF).await;
+                    if out_of_range {
+                        tracing::warn!(
+                            table = %table_path,
+                            "Fluss changelog segments were truncated past the checkpoint; replaying from EARLIEST — PK upserts/deletes converge the accelerated table"
+                        );
+                        match resubscribe_cdc_earliest(&connection, &table_path, num_buckets, is_partitioned).await {
+                            Ok(new_scanner) => {
+                                scanner = new_scanner;
+                                // Checkpoints restart from the replay position.
+                                consumed_offsets.clear();
+                            }
+                            Err(e2) => yield Err(e2),
+                        }
+                    }
                     continue;
                 }
             };
