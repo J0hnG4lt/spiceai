@@ -10,7 +10,7 @@ FROM docker.io/library/rust:1-bookworm AS build
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
-       pkg-config libssl-dev cmake protobuf-compiler libsqlite3-dev \
+       pkg-config libssl-dev cmake protobuf-compiler libprotobuf-dev libsqlite3-dev \
        clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 

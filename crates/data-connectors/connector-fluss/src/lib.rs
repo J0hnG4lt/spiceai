@@ -394,10 +394,7 @@ impl DataConnector for Fluss {
         let dataset = self.dataset.get().cloned();
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
-            let Some(fluss_provider) = table_provider
-                .as_any()
-                .downcast_ref::<FlussTableProvider>()
-            else {
+            let Some(fluss_provider) = table_provider.downcast_ref::<FlussTableProvider>() else {
                 tracing::error!("Failed to downcast TableProvider to FlussTableProvider");
                 return;
             };
@@ -443,10 +440,7 @@ impl DataConnector for Fluss {
         let dataset = dataset.clone();
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
-            let Some(fluss_provider) = table_provider
-                .as_any()
-                .downcast_ref::<FlussTableProvider>()
-            else {
+            let Some(fluss_provider) = table_provider.downcast_ref::<FlussTableProvider>() else {
                 tracing::error!("Failed to downcast TableProvider to FlussTableProvider");
                 return;
             };

@@ -39,7 +39,7 @@ use arrow::array::{ArrayRef, ListArray, RecordBatch, StringArray, StructArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use async_stream::stream;
-use data_components::cdc::{self, ChangeBatch, ChangesStream, CommitChange, CommitError};
+use data_components::cdc::{self, ChangeBatch, ChangesStream, CommitChange};
 use fluss::PartitionId;
 use fluss::client::{EARLIEST_OFFSET, FlussConnection};
 use fluss::metadata::TablePath;
