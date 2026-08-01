@@ -89,8 +89,9 @@ services:
       # Acceleration files + checkpoint sidecars must survive container
       # restarts and recreation for the resume scenarios.
       - spice-state:/app/.spice
-    depends_on:
-      - coordinator
+    # NO depends_on: podman-compose recreates dependency containers on
+    # `up -d spiced`, which would wipe ZooKeeper (and with it every Fluss
+    # table) mid-suite. The runner script owns the ordering.
     profiles:
       - spice
 

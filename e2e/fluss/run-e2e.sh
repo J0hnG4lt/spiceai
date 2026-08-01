@@ -66,7 +66,7 @@ curl_c() {
 sql() {
   curl_c -sf -X POST "${SPICE_HTTP}/v1/sql" \
     -H "Content-Type: application/json" \
-    -d "{\"sql\": \"$1\"}"
+    -d "{\"sql\": \"$1\", \"parameters\": []}"
 }
 
 # Extract the first integer field named `cnt` from a SQL JSON response.
@@ -145,8 +145,13 @@ start_spiced() {
 
 down() { compose --profile spice down; }
 
+# Force-remove by name: podman-compose down can fail on depends_on ordering,
+# leaving stale containers that then collide on the next up.
 clean() {
-  compose --profile spice down -v || true
+  compose --profile spice down -v > /dev/null 2>&1 || true
+  podman rm -f spiced-fluss fluss-mixed \
+    fluss-tablet-server-1 fluss-tablet-server-0 fluss-coordinator fluss-zookeeper \
+    > /dev/null 2>&1 || true
   podman volume rm -f fluss_spice-state > /dev/null 2>&1 || true
 }
 
@@ -229,7 +234,7 @@ s4_graceful_resume() {
   CURRENT_SCENARIO=s4
   log "s4: graceful restart — SIGTERM spiced, restart, verify exact checkpoint resume"
   podman stop spiced-fluss || { fail "s4 podman stop"; return; }
-  compose --profile spice up -d spiced || { fail "s4 restart"; return; }
+  podman start spiced-fluss || { fail "s4 restart"; return; }
   wait_spice_healthy 180 || { fail "s4 spiced not healthy after restart"; return; }
 
   local count
@@ -253,7 +258,7 @@ s5_crash_resume() {
   CURRENT_SCENARIO=s5
   log "s5: crash — SIGKILL spiced, restart, verify at-least-once resume"
   podman kill spiced-fluss || { fail "s5 podman kill"; return; }
-  compose --profile spice up -d spiced || { fail "s5 restart"; return; }
+  podman start spiced-fluss || { fail "s5 restart"; return; }
   wait_spice_healthy 180 || { fail "s5 spiced not healthy after crash"; return; }
 
   # Appends are at-least-once across a hard crash (offsets commit after the
