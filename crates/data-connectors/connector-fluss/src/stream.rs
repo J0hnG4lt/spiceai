@@ -48,7 +48,7 @@ use fluss::rpc::message::OffsetSpec;
 
 use super::provider::FlussMetrics;
 
-/// Offset key type: (partition_id, bucket_id).
+/// Offset key type: (`partition_id`, `bucket_id`).
 /// `None` partition for non-partitioned tables.
 pub type OffsetKey = (Option<PartitionId>, i32);
 
@@ -152,15 +152,19 @@ async fn prepare_subscription(
             let pid = partition_info.get_partition_id();
             let partition_name = partition_info.get_partition_name();
             let offsets = admin
-                .list_partition_offsets(table_path, &partition_name, &bucket_ids, OffsetSpec::Latest)
+                .list_partition_offsets(
+                    table_path,
+                    &partition_name,
+                    &bucket_ids,
+                    OffsetSpec::Latest,
+                )
                 .await
                 .map_err(fluss_err)?;
             for (bucket, offset) in offsets {
                 high_watermarks.insert((Some(pid), bucket), offset);
             }
             for bucket in 0..num_buckets {
-                partition_bucket_offsets
-                    .insert((pid, bucket), start_offset(&(Some(pid), bucket)));
+                partition_bucket_offsets.insert((pid, bucket), start_offset(&(Some(pid), bucket)));
             }
         }
     } else {
@@ -214,7 +218,12 @@ async fn resubscribe_log_tail(
         for partition_info in &partitions {
             let partition_name = partition_info.get_partition_name();
             let latest = admin
-                .list_partition_offsets(table_path, &partition_name, &bucket_ids, OffsetSpec::Latest)
+                .list_partition_offsets(
+                    table_path,
+                    &partition_name,
+                    &bucket_ids,
+                    OffsetSpec::Latest,
+                )
                 .await
                 .map_err(fluss_err)?;
             for (bucket, offset) in latest {
@@ -230,7 +239,10 @@ async fn resubscribe_log_tail(
             .list_offsets(table_path, &bucket_ids, OffsetSpec::Latest)
             .await
             .map_err(fluss_err)?;
-        scanner.subscribe_buckets(&latest).await.map_err(fluss_err)?;
+        scanner
+            .subscribe_buckets(&latest)
+            .await
+            .map_err(fluss_err)?;
     }
     Ok(scanner)
 }
@@ -265,15 +277,18 @@ async fn resubscribe_cdc_earliest(
             .await
             .map_err(fluss_err)?;
     } else {
-        let offsets: HashMap<i32, i64> =
-            (0..num_buckets).map(|b| (b, EARLIEST_OFFSET)).collect();
-        scanner.subscribe_buckets(&offsets).await.map_err(fluss_err)?;
+        let offsets: HashMap<i32, i64> = (0..num_buckets).map(|b| (b, EARLIEST_OFFSET)).collect();
+        scanner
+            .subscribe_buckets(&offsets)
+            .await
+            .map_err(fluss_err)?;
     }
     Ok(scanner)
 }
 
 /// Create a `ChangesStream` that polls a Fluss log table for new records
 /// (append mode — every record is a "create").
+#[expect(clippy::implicit_hasher)]
 pub async fn stream_log_table(
     connection: Arc<FlussConnection>,
     table_path: TablePath,
@@ -515,6 +530,7 @@ fn build_cdc_change_batch(
 /// converges to current state via PK upserts; this requires the table's
 /// changelog retention (`table.log.ttl`) to cover its history. Resume uses the
 /// per-bucket offsets persisted by the envelope committers.
+#[expect(clippy::implicit_hasher)]
 pub async fn stream_cdc_table(
     connection: Arc<FlussConnection>,
     table_path: TablePath,
@@ -651,4 +667,122 @@ pub async fn stream_cdc_table(
     };
 
     Ok(Box::pin(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::Schema;
+    use data_components::cdc::ChangeOperation;
+    use fluss::metadata::RowType;
+    use fluss::record::ScanRecord;
+    use fluss::row::ColumnarRow;
+
+    fn wm(entries: &[(OffsetKey, i64)]) -> HashMap<OffsetKey, i64> {
+        entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn caught_up_when_no_watermarks() {
+        assert!(caught_up(&HashMap::new(), &HashMap::new()));
+    }
+
+    #[test]
+    fn caught_up_empty_buckets_are_ready_without_consumption() {
+        let watermarks = wm(&[((None, 0), 0), ((None, 1), 0)]);
+        assert!(caught_up(&watermarks, &HashMap::new()));
+    }
+
+    #[test]
+    fn caught_up_requires_consumption_to_watermark_minus_one() {
+        let watermarks = wm(&[((None, 0), 5)]);
+        assert!(!caught_up(&watermarks, &HashMap::new()));
+        assert!(!caught_up(&watermarks, &wm(&[((None, 0), 3)])));
+        // last consumed offset is inclusive; watermark is exclusive
+        assert!(caught_up(&watermarks, &wm(&[((None, 0), 4)])));
+    }
+
+    #[test]
+    fn caught_up_partitioned_keys_tracked_independently() {
+        let watermarks = wm(&[((Some(7), 0), 2), ((Some(8), 0), 2)]);
+        let consumed = wm(&[((Some(7), 0), 1)]);
+        assert!(!caught_up(&watermarks, &consumed));
+        let consumed = wm(&[((Some(7), 0), 1), ((Some(8), 0), 1)]);
+        assert!(caught_up(&watermarks, &consumed));
+    }
+
+    #[test]
+    fn change_type_mapping_skips_update_before() {
+        assert_eq!(change_type_to_op(ChangeType::AppendOnly), Some("c"));
+        assert_eq!(change_type_to_op(ChangeType::Insert), Some("c"));
+        assert_eq!(change_type_to_op(ChangeType::UpdateAfter), Some("u"));
+        assert_eq!(change_type_to_op(ChangeType::Delete), Some("d"));
+        assert_eq!(change_type_to_op(ChangeType::UpdateBefore), None);
+    }
+
+    fn test_batch() -> (SchemaRef, Arc<RecordBatch>) {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["alice", "bob"])),
+            ],
+        )
+        .expect("test batch");
+        (schema, Arc::new(batch))
+    }
+
+    fn scan_record(
+        batch: &Arc<RecordBatch>,
+        row_id: usize,
+        offset: i64,
+        ct: ChangeType,
+    ) -> ScanRecord {
+        let row = ColumnarRow::new(
+            Arc::clone(batch),
+            Arc::new(RowType::new(vec![])),
+            row_id,
+            None,
+        )
+        .expect("columnar row");
+        ScanRecord::new(row, offset, 0, ct)
+    }
+
+    #[test]
+    fn cdc_change_batch_maps_ops_and_filters_update_before() {
+        let (schema, batch) = test_batch();
+        let records = vec![
+            scan_record(&batch, 0, 10, ChangeType::Insert),
+            scan_record(&batch, 0, 11, ChangeType::UpdateBefore),
+            scan_record(&batch, 1, 12, ChangeType::UpdateAfter),
+            scan_record(&batch, 1, 13, ChangeType::Delete),
+        ];
+        let pks = vec!["user_id".to_string()];
+
+        let change_batch = build_cdc_change_batch(&records, &schema, &pks)
+            .expect("build")
+            .expect("non-empty");
+
+        // UpdateBefore filtered: 4 records -> 3 rows.
+        assert_eq!(change_batch.data_batch().num_rows(), 3);
+        assert!(matches!(change_batch.op(0), ChangeOperation::Create));
+        assert!(matches!(change_batch.op(1), ChangeOperation::Update));
+        assert!(matches!(change_batch.op(2), ChangeOperation::Delete));
+        for row in 0..3 {
+            assert_eq!(change_batch.primary_keys(row), vec!["user_id".to_string()]);
+        }
+    }
+
+    #[test]
+    fn cdc_change_batch_all_update_before_is_none() {
+        let (schema, batch) = test_batch();
+        let records = vec![scan_record(&batch, 0, 10, ChangeType::UpdateBefore)];
+        let result = build_cdc_change_batch(&records, &schema, &[]).expect("build");
+        assert!(result.is_none());
+    }
 }

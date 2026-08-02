@@ -30,8 +30,8 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 
 use async_stream::stream;
 use data_components::cdc::{self, ChangesStream, CommitChange, CommitError};
@@ -134,11 +134,10 @@ struct FlussStreamCommitter {
 #[async_trait]
 impl CommitChange for FlussStreamCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
-        let checkpoint_json = serialize_offsets(&self.offsets).map_err(|e| {
-            CommitError::UnableToCommitChange {
+        let checkpoint_json =
+            serialize_offsets(&self.offsets).map_err(|e| CommitError::UnableToCommitChange {
                 source: Box::new(e),
-            }
-        })?;
+            })?;
 
         if let Some(store) = self.store.as_ref() {
             store.upsert(&checkpoint_json).await.map_err(|e| {
@@ -180,23 +179,22 @@ async fn initialize_checkpoint(
     };
 
     let initial_offsets = match store.get().await {
-        Ok(Some(checkpoint)) => match deserialize_offsets(&checkpoint.data) {
-            Some(offsets) => {
+        Ok(Some(checkpoint)) => {
+            if let Some(offsets) = deserialize_offsets(&checkpoint.data) {
                 tracing::info!(
                     dataset = %dataset.name,
                     num_offsets = offsets.len(),
                     "Resuming Fluss stream from persisted offsets"
                 );
                 Some(offsets)
-            }
-            None => {
+            } else {
                 tracing::warn!(
                     dataset = %dataset.name,
                     "Failed to deserialize the persisted Fluss checkpoint, starting from the beginning"
                 );
                 None
             }
-        },
+        }
         Ok(None) => None,
         Err(err) => {
             tracing::error!(
@@ -232,7 +230,9 @@ pub struct Fluss {
 
 impl std::fmt::Debug for Fluss {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Fluss").field("params", &self.params).finish_non_exhaustive()
+        f.debug_struct("Fluss")
+            .field("params", &self.params)
+            .finish_non_exhaustive()
     }
 }
 
@@ -251,13 +251,11 @@ impl FlussFactory {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("bootstrap_servers")
-        .required()
-        .description("The Fluss coordinator server address (host:port).")
-        .examples(&["localhost:9123"])
-        .help_link(FLUSS_DOCS),
-];
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::component("bootstrap_servers")
+    .required()
+    .description("The Fluss coordinator server address (host:port).")
+    .examples(&["localhost:9123"])
+    .help_link(FLUSS_DOCS)];
 
 impl DataConnectorFactory for FlussFactory {
     fn as_any(&self) -> &dyn Any {
@@ -345,8 +343,10 @@ impl DataConnector for Fluss {
         })?;
         let table_path = TablePath::new(database, table);
 
-        let mut config = FlussConfig::default();
-        config.bootstrap_servers = bootstrap_servers;
+        let config = FlussConfig {
+            bootstrap_servers,
+            ..FlussConfig::default()
+        };
 
         let connection = Arc::new(FlussConnection::new(config).await.boxed().context(
             UnableToGetReadProviderSnafu {
@@ -534,7 +534,10 @@ impl MetricsProvider for FlussMetricsProvider {
             "records_consumed_total" => {
                 let metrics = Arc::clone(&self.metrics);
                 Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(metrics.records_consumed.load(Ordering::Relaxed), &attributes);
+                    observer.observe(
+                        metrics.records_consumed.load(Ordering::Relaxed),
+                        &attributes,
+                    );
                 })))
             }
             "bytes_consumed_total" => {
@@ -569,3 +572,26 @@ runtime::register_data_connector!(
     CONNECTOR_NAME,
     FlussFactory
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_offsets_roundtrip() {
+        let mut offsets: HashMap<OffsetKey, i64> = HashMap::new();
+        offsets.insert((None, 0), 42);
+        offsets.insert((None, 2), 7);
+        offsets.insert((Some(11), 1), 1_000_000);
+
+        let json = serialize_offsets(&offsets).expect("serialize");
+        let restored = deserialize_offsets(&json).expect("deserialize");
+        assert_eq!(restored, offsets);
+    }
+
+    #[test]
+    fn checkpoint_deserialize_rejects_garbage() {
+        assert!(deserialize_offsets("not json").is_none());
+        assert!(deserialize_offsets("{\"other\": 1}").is_none());
+    }
+}

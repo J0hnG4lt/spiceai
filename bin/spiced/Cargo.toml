@@ -25,7 +25,7 @@ connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", opt
 connector-ducklake = { path = "../../crates/data-connectors/connector-ducklake" }
 connector-elasticsearch = { path = "../../crates/data-connectors/connector-elasticsearch", optional = true }
 connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql", optional = true }
-connector-fluss = { path = "../../crates/data-connectors/connector-fluss" }
+connector-fluss = { path = "../../crates/data-connectors/connector-fluss", optional = true }
 connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional = true }
 connector-gcs = { path = "../../crates/data-connectors/connector-gcs" }
 connector-git = { path = "../../crates/data-connectors/connector-git" }
@@ -106,6 +106,7 @@ default = [
     "sqlite",
     "mysql",
     "flightsql",
+    "fluss",
     "delta_lake",
     "databricks",
     "dremio",
@@ -143,6 +144,7 @@ elasticsearch = ["connector-elasticsearch", "runtime/elasticsearch"]
 duckdb = ["connector-duckdb", "runtime/duckdb"]
 dynamodb = ["connector-dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
+fluss = ["connector-fluss"]
 ftp = ["connector-ftp", "runtime/ftp"]
 http-functions = ["runtime/http-functions"]
 rate-control = ["runtime/rate-control"]

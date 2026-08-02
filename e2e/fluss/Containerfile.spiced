@@ -17,11 +17,14 @@ RUN apt-get update \
 WORKDIR /build
 COPY . .
 
+# Overridable so `--target build --build-arg BUILD_CMD="cargo clippy ..."` can
+# run the signoff-equivalent checks (fmt/clippy/test) with the same warm caches.
+ARG BUILD_CMD="cargo build -p spiced --no-default-features --features duckdb,flightsql,fluss && cp /build/target/debug/spiced /usr/local/bin/spiced"
+
 RUN --mount=type=cache,id=spiced-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=spiced-gitdb,target=/usr/local/cargo/git \
     --mount=type=cache,id=spiced-target,target=/build/target \
-    cargo build -p spiced --no-default-features --features duckdb,flightsql \
-    && cp /build/target/debug/spiced /usr/local/bin/spiced
+    bash -c "${BUILD_CMD}"
 
 FROM docker.io/library/debian:bookworm-slim
 
