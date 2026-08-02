@@ -59,6 +59,8 @@ use connector_dynamodb as _;
 use connector_elasticsearch as _;
 #[cfg(feature = "flightsql")]
 use connector_flightsql as _;
+#[cfg(feature = "fluss")]
+use connector_fluss as _;
 #[cfg(feature = "ftp")]
 use connector_ftp as _;
 use connector_gcs as _;

@@ -1,0 +1,99 @@
+# Fluss cluster + spiced for the connector-fluss E2E suite.
+#
+# Host networking throughout: bridge networking is unreliable on rootless
+# podman-on-WSL2 (aardvark-dns), and host networking lets every service use
+# localhost, matching the spicepod and producer defaults.
+#
+# No compose healthchecks (they need systemd timers under podman); the runner
+# script polls for readiness instead.
+#
+# Managed by e2e/fluss/run-e2e.sh — see that script and README.md for usage.
+
+services:
+  zookeeper:
+    image: docker.io/library/zookeeper:${ZK_VERSION:-3.9.2}
+    container_name: fluss-zookeeper
+    network_mode: host
+    environment:
+      ZOO_4LW_COMMANDS_WHITELIST: ruok
+      ZOO_ADMINSERVER_ENABLED: "false"
+      ZOO_PORT: ${ZK_PORT:-2181}
+    tmpfs:
+      - /data
+      - /datalog
+      - /logs
+
+  coordinator:
+    image: ${FLUSS_IMAGE:-docker.io/apache/fluss}:${FLUSS_VERSION:-0.9.1-incubating}
+    container_name: fluss-coordinator
+    network_mode: host
+    command: ["coordinatorServer"]
+    environment:
+      FLUSS_PROPERTIES: |
+        zookeeper.address: localhost:${ZK_PORT:-2181}
+        bind.listeners: FLUSS://0.0.0.0:0, CLIENT://0.0.0.0:${COORDINATOR_PORT:-9123}
+        advertised.listeners: CLIENT://localhost:${COORDINATOR_PORT:-9123}
+        internal.listener.name: FLUSS
+        remote.data.dir: /tmp/fluss/remote-data
+    depends_on:
+      - zookeeper
+
+  tablet-server-0:
+    image: ${FLUSS_IMAGE:-docker.io/apache/fluss}:${FLUSS_VERSION:-0.9.1-incubating}
+    container_name: fluss-tablet-server-0
+    network_mode: host
+    command: ["tabletServer"]
+    environment:
+      FLUSS_PROPERTIES: |
+        zookeeper.address: localhost:${ZK_PORT:-2181}
+        bind.listeners: FLUSS://0.0.0.0:0, CLIENT://0.0.0.0:${TABLET0_PORT:-9124}
+        advertised.listeners: CLIENT://localhost:${TABLET0_PORT:-9124}
+        internal.listener.name: FLUSS
+        tablet-server.id: 0
+        data.dir: /tmp/fluss/data
+        remote.data.dir: /tmp/fluss/remote-data
+    depends_on:
+      - coordinator
+
+  tablet-server-1:
+    image: ${FLUSS_IMAGE:-docker.io/apache/fluss}:${FLUSS_VERSION:-0.9.1-incubating}
+    container_name: fluss-tablet-server-1
+    network_mode: host
+    command: ["tabletServer"]
+    environment:
+      FLUSS_PROPERTIES: |
+        zookeeper.address: localhost:${ZK_PORT:-2181}
+        bind.listeners: FLUSS://0.0.0.0:0, CLIENT://0.0.0.0:${TABLET1_PORT:-9125}
+        advertised.listeners: CLIENT://localhost:${TABLET1_PORT:-9125}
+        internal.listener.name: FLUSS
+        tablet-server.id: 1
+        data.dir: /tmp/fluss/data-1
+        remote.data.dir: /tmp/fluss/remote-data
+    depends_on:
+      - coordinator
+
+  # Started separately by the runner (profile: spice) so scenarios control
+  # whether data exists before or after spiced boots (bootstrap testing).
+  spiced:
+    image: localhost/spiced-fluss:dev
+    container_name: spiced-fluss
+    network_mode: host
+    # Non-default ports so the suite coexists with any other spiced on the
+    # machine (host networking shares one port namespace).
+    command:
+      - "--http"
+      - "127.0.0.1:${SPICE_HTTP_PORT:-18090}"
+      - "--flight"
+      - "127.0.0.1:${SPICE_FLIGHT_PORT:-15051}"
+    volumes:
+      # Acceleration files + checkpoint sidecars must survive container
+      # restarts and recreation for the resume scenarios.
+      - spice-state:/app/.spice
+    # NO depends_on: podman-compose recreates dependency containers on
+    # `up -d spiced`, which would wipe ZooKeeper (and with it every Fluss
+    # table) mid-suite. The runner script owns the ordering.
+    profiles:
+      - spice
+
+volumes:
+  spice-state:

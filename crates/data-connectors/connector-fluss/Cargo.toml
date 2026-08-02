@@ -1,0 +1,33 @@
+[package]
+name = "connector-fluss"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "Apache Fluss data connector for Spice.ai runtime"
+
+[dependencies]
+arrow.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+data_components = { path = "../../data_components" }
+datafusion.workspace = true
+# Pinned to the fork's `arrow-58` branch (= apache/fluss-rust main + Arrow 57->58
+# bump) until upstream releases an Arrow 58-compatible fluss-rs on crates.io.
+fluss = { package = "fluss-rs", git = "https://github.com/J0hnG4lt/fluss-rust.git", branch = "arrow-58" }
+futures.workspace = true
+linkme.workspace = true
+opentelemetry.workspace = true
+runtime = { path = "../../runtime" }
+runtime-api-types = { path = "../../runtime-api-types" }
+runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
+runtime-metrics = { path = "../../runtime-metrics" }
+serde.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

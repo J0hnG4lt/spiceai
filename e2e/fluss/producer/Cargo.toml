@@ -1,0 +1,16 @@
+[package]
+name = "fluss-producer"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic Fluss data producer for the SpiceAI connector-fluss E2E suite"
+license = "Apache-2.0"
+
+# Standalone crate — intentionally detached from the spiceai workspace so it can
+# build in its own container with only the fluss-rs dependency tree.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+fluss = { package = "fluss-rs", git = "https://github.com/J0hnG4lt/fluss-rust.git", branch = "arrow-58" }
+tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,30 @@
+# Builds the deterministic Fluss data producer for the E2E suite.
+#
+# Build with the producer crate as context:
+#   podman build -f e2e/fluss/Containerfile.producer -t localhost/fluss-producer:dev e2e/fluss/producer
+
+FROM docker.io/library/rust:1-bookworm AS build
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+       pkg-config libssl-dev protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+
+RUN --mount=type=cache,id=producer-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=producer-gitdb,target=/usr/local/cargo/git \
+    --mount=type=cache,id=producer-target,target=/build/target \
+    cargo build --release \
+    && cp /build/target/release/fluss-producer /usr/local/bin/fluss-producer
+
+FROM docker.io/library/debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/local/bin/fluss-producer /usr/local/bin/fluss-producer
+
+ENTRYPOINT ["/usr/local/bin/fluss-producer"]

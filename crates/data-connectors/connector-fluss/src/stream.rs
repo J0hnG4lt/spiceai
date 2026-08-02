@@ -1,0 +1,788 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Streaming logic for Fluss tables.
+//!
+//! - **Log tables** (no primary key): Uses `RecordBatchLogScanner` for batch-level
+//!   polling, wrapping records as "create" operations (append mode).
+//! - **PK tables** (primary key): Uses `LogScanner` for per-record polling with
+//!   `ChangeType` awareness, mapping the changelog to CDC operations (changes mode).
+//!
+//! Both paths checkpoint per-(partition, bucket) offsets through the committer
+//! carried on each [`ChangeEnvelope`]: the committer runs only after the batch is
+//! durably applied by the accelerator, giving at-least-once delivery on restart.
+//!
+//! **Bootstrap readiness**: high watermarks are captured at subscribe time; the
+//! stream reports `is_dataset_ready=false` until every subscribed (partition,
+//! bucket) has been consumed up to its watermark. When the flip to ready happens
+//! on an idle poll (e.g. resuming a checkpoint already at the tail), a zero-row
+//! ready-signal envelope is emitted so the dataset still transitions to Ready.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use arrow::array::{ArrayRef, ListArray, RecordBatch, StringArray, StructArray};
+use arrow::buffer::OffsetBuffer;
+use arrow::datatypes::{DataType, Field, SchemaRef};
+use async_stream::stream;
+use data_components::cdc::{self, ChangeBatch, ChangesStream, CommitChange};
+use fluss::PartitionId;
+use fluss::client::{EARLIEST_OFFSET, FlussConnection, LogScanner, RecordBatchLogScanner};
+use fluss::metadata::TablePath;
+use fluss::record::ChangeType;
+use fluss::rpc::message::OffsetSpec;
+
+use super::provider::FlussMetrics;
+
+/// Offset key type: (`partition_id`, `bucket_id`).
+/// `None` partition for non-partitioned tables.
+pub type OffsetKey = (Option<PartitionId>, i32);
+
+/// Factory closure that creates a `CommitChange` from the current consumed offsets.
+///
+/// Called by the stream functions per envelope to create a committer that
+/// persists the latest offsets. If `None`, a no-op committer is used.
+pub type CommitterFactory =
+    Arc<dyn Fn(HashMap<OffsetKey, i64>) -> Box<dyn CommitChange + Send + Sync> + Send + Sync>;
+
+/// Default poll timeout for the Fluss log scanner.
+const POLL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Pause after a poll error before polling again, so a persistent server-side
+/// failure surfaces as one error per second instead of a hot loop.
+const ERROR_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Wrap a Fluss client error into the connector-agnostic CDC stream error.
+fn fluss_err(e: fluss::error::Error) -> cdc::StreamError {
+    cdc::StreamError::Connector {
+        connector: "fluss",
+        source: Box::new(e),
+    }
+}
+
+/// Whether the error means our subscription offset points past the log
+/// segments the server still has (`LogOffsetOutOfRangeException`) — e.g. a
+/// tablet server lost its unflushed tail, truncating the log under our
+/// checkpoint. Matched on the message: the client surfaces server API errors
+/// as strings.
+fn is_offset_out_of_range(e: &fluss::error::Error) -> bool {
+    e.to_string().contains("out of range")
+}
+
+/// Create a committer — either from the factory or a no-op fallback.
+fn make_committer(
+    factory: Option<&CommitterFactory>,
+    offsets: &HashMap<OffsetKey, i64>,
+) -> Box<dyn CommitChange + Send + Sync> {
+    match factory {
+        Some(f) => f(offsets.clone()),
+        None => Box::new(cdc::NoOpCommitter),
+    }
+}
+
+/// Whether every watermarked (partition, bucket) has been consumed to its high
+/// watermark. `last consumed offset` is inclusive; the watermark is exclusive
+/// (next-to-write, Kafka semantics).
+fn caught_up(
+    high_watermarks: &HashMap<OffsetKey, i64>,
+    consumed_offsets: &HashMap<OffsetKey, i64>,
+) -> bool {
+    high_watermarks.iter().all(|(key, &watermark)| {
+        consumed_offsets
+            .get(key)
+            .map_or(watermark <= 0, |&consumed| consumed >= watermark - 1)
+    })
+}
+
+/// Shared subscribe-time setup: capture high watermarks for every (partition,
+/// bucket), then compute the start offset per bucket — resuming one past the
+/// checkpointed offset when available, otherwise from `EARLIEST_OFFSET`.
+///
+/// Returns `(high_watermarks, bucket_offsets, partition_bucket_offsets)`; exactly
+/// one of the two offset maps is non-empty depending on whether the table is
+/// partitioned.
+async fn prepare_subscription(
+    connection: &FlussConnection,
+    table_path: &TablePath,
+    num_buckets: i32,
+    is_partitioned: bool,
+    initial_offsets: Option<&HashMap<OffsetKey, i64>>,
+) -> Result<
+    (
+        HashMap<OffsetKey, i64>,
+        HashMap<i32, i64>,
+        HashMap<(PartitionId, i32), i64>,
+    ),
+    cdc::StreamError,
+> {
+    let admin = connection.get_admin().map_err(fluss_err)?;
+    let bucket_ids: Vec<i32> = (0..num_buckets).collect();
+
+    let mut high_watermarks: HashMap<OffsetKey, i64> = HashMap::new();
+    let mut bucket_offsets: HashMap<i32, i64> = HashMap::new();
+    let mut partition_bucket_offsets: HashMap<(PartitionId, i32), i64> = HashMap::new();
+
+    let start_offset = |key: &OffsetKey| {
+        initial_offsets
+            .and_then(|m| m.get(key).copied())
+            .map_or(EARLIEST_OFFSET, |o| o + 1) // resume AFTER last committed offset
+    };
+
+    if is_partitioned {
+        let partitions = admin
+            .list_partition_infos(table_path)
+            .await
+            .map_err(fluss_err)?;
+
+        for partition_info in &partitions {
+            let pid = partition_info.get_partition_id();
+            let partition_name = partition_info.get_partition_name();
+            let offsets = admin
+                .list_partition_offsets(
+                    table_path,
+                    &partition_name,
+                    &bucket_ids,
+                    OffsetSpec::Latest,
+                )
+                .await
+                .map_err(fluss_err)?;
+            for (bucket, offset) in offsets {
+                high_watermarks.insert((Some(pid), bucket), offset);
+            }
+            for bucket in 0..num_buckets {
+                partition_bucket_offsets.insert((pid, bucket), start_offset(&(Some(pid), bucket)));
+            }
+        }
+    } else {
+        let offsets = admin
+            .list_offsets(table_path, &bucket_ids, OffsetSpec::Latest)
+            .await
+            .map_err(fluss_err)?;
+        for (bucket, offset) in offsets {
+            high_watermarks.insert((None, bucket), offset);
+        }
+        for bucket in 0..num_buckets {
+            bucket_offsets.insert(bucket, start_offset(&(None, bucket)));
+        }
+    }
+
+    Ok((high_watermarks, bucket_offsets, partition_bucket_offsets))
+}
+
+/// Seed the consumed-offsets map from the checkpoint so readiness accounting
+/// starts from the resume position rather than zero. Without this, a stream that
+/// resumes at the tail of an idle table would never observe records and never
+/// report ready.
+fn seed_consumed(initial_offsets: Option<&HashMap<OffsetKey, i64>>) -> HashMap<OffsetKey, i64> {
+    initial_offsets.cloned().unwrap_or_default()
+}
+
+/// Recovery for an append stream whose checkpoint points past the segments the
+/// server still has: appended rows cannot be replayed without duplicating the
+/// whole table, so rejoin at the live tail. The lost range is gone at the
+/// source; the caller logs the gap loudly.
+async fn resubscribe_log_tail(
+    connection: &FlussConnection,
+    table_path: &TablePath,
+    num_buckets: i32,
+    is_partitioned: bool,
+) -> Result<RecordBatchLogScanner, cdc::StreamError> {
+    let admin = connection.get_admin().map_err(fluss_err)?;
+    let bucket_ids: Vec<i32> = (0..num_buckets).collect();
+    let table = connection.get_table(table_path).await.map_err(fluss_err)?;
+    let scanner = table
+        .new_scan()
+        .create_record_batch_log_scanner()
+        .map_err(fluss_err)?;
+
+    if is_partitioned {
+        let partitions = admin
+            .list_partition_infos(table_path)
+            .await
+            .map_err(fluss_err)?;
+        let mut offsets: HashMap<(PartitionId, i32), i64> = HashMap::new();
+        for partition_info in &partitions {
+            let partition_name = partition_info.get_partition_name();
+            let latest = admin
+                .list_partition_offsets(
+                    table_path,
+                    &partition_name,
+                    &bucket_ids,
+                    OffsetSpec::Latest,
+                )
+                .await
+                .map_err(fluss_err)?;
+            for (bucket, offset) in latest {
+                offsets.insert((partition_info.get_partition_id(), bucket), offset);
+            }
+        }
+        scanner
+            .subscribe_partition_buckets(&offsets)
+            .await
+            .map_err(fluss_err)?;
+    } else {
+        let latest = admin
+            .list_offsets(table_path, &bucket_ids, OffsetSpec::Latest)
+            .await
+            .map_err(fluss_err)?;
+        scanner
+            .subscribe_buckets(&latest)
+            .await
+            .map_err(fluss_err)?;
+    }
+    Ok(scanner)
+}
+
+/// Recovery for a CDC stream whose checkpoint points past the surviving log
+/// segments: replay the whole changelog from `EARLIEST_OFFSET`. PK operations
+/// are idempotent upserts/deletes, so the replay converges the accelerator to
+/// the source's current state.
+async fn resubscribe_cdc_earliest(
+    connection: &FlussConnection,
+    table_path: &TablePath,
+    num_buckets: i32,
+    is_partitioned: bool,
+) -> Result<LogScanner, cdc::StreamError> {
+    let table = connection.get_table(table_path).await.map_err(fluss_err)?;
+    let scanner = table.new_scan().create_log_scanner().map_err(fluss_err)?;
+
+    if is_partitioned {
+        let admin = connection.get_admin().map_err(fluss_err)?;
+        let partitions = admin
+            .list_partition_infos(table_path)
+            .await
+            .map_err(fluss_err)?;
+        let mut offsets: HashMap<(PartitionId, i32), i64> = HashMap::new();
+        for partition_info in &partitions {
+            for bucket in 0..num_buckets {
+                offsets.insert((partition_info.get_partition_id(), bucket), EARLIEST_OFFSET);
+            }
+        }
+        scanner
+            .subscribe_partition_buckets(&offsets)
+            .await
+            .map_err(fluss_err)?;
+    } else {
+        let offsets: HashMap<i32, i64> = (0..num_buckets).map(|b| (b, EARLIEST_OFFSET)).collect();
+        scanner
+            .subscribe_buckets(&offsets)
+            .await
+            .map_err(fluss_err)?;
+    }
+    Ok(scanner)
+}
+
+/// Create a `ChangesStream` that polls a Fluss log table for new records
+/// (append mode — every record is a "create").
+#[expect(clippy::implicit_hasher)]
+pub async fn stream_log_table(
+    connection: Arc<FlussConnection>,
+    table_path: TablePath,
+    metrics: Arc<FlussMetrics>,
+    initial_offsets: Option<HashMap<OffsetKey, i64>>,
+    committer_factory: Option<CommitterFactory>,
+) -> Result<ChangesStream, cdc::StreamError> {
+    let table = connection.get_table(&table_path).await.map_err(fluss_err)?;
+    let table_info = table.get_table_info();
+    let schema: SchemaRef = fluss::record::to_arrow_schema(table_info.row_type())
+        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
+
+    let num_buckets = table_info.get_num_buckets();
+    let is_partitioned = table_info.is_partitioned();
+
+    let (high_watermarks, bucket_offsets, partition_bucket_offsets) = prepare_subscription(
+        &connection,
+        &table_path,
+        num_buckets,
+        is_partitioned,
+        initial_offsets.as_ref(),
+    )
+    .await?;
+
+    let mut scanner = table
+        .new_scan()
+        .create_record_batch_log_scanner()
+        .map_err(fluss_err)?;
+    // `table` borrows `connection`, which moves into the generator below.
+    drop(table);
+
+    if is_partitioned {
+        scanner
+            .subscribe_partition_buckets(&partition_bucket_offsets)
+            .await
+            .map_err(fluss_err)?;
+    } else {
+        scanner
+            .subscribe_buckets(&bucket_offsets)
+            .await
+            .map_err(fluss_err)?;
+    }
+
+    let mut consumed_offsets = seed_consumed(initial_offsets.as_ref());
+    let starts_ready = caught_up(&high_watermarks, &consumed_offsets);
+
+    let stream = stream! {
+        let mut is_ready = starts_ready;
+
+        // A stream that starts caught up (empty table, or a resume whose
+        // checkpoint already covers the watermarks) would otherwise emit no
+        // envelope until new data arrives — leaving the dataset NotReady and
+        // unqueryable indefinitely. Announce readiness up front.
+        if is_ready {
+            match cdc::build_ready_signal_envelope(&schema) {
+                Ok(envelope) => yield Ok(envelope),
+                Err(e) => yield Err(e.into()),
+            }
+        }
+
+        loop {
+            let batches = match scanner.poll(POLL_TIMEOUT).await {
+                Ok(batches) => batches,
+                Err(e) => {
+                    metrics.inc_poll_errors();
+                    let out_of_range = is_offset_out_of_range(&e);
+                    yield Err(fluss_err(e));
+                    tokio::time::sleep(ERROR_BACKOFF).await;
+                    if out_of_range {
+                        tracing::warn!(
+                            table = %table_path,
+                            "Fluss log segments were truncated past the checkpoint (source-side data loss); rejoining at the live tail — rows in the lost range cannot be recovered"
+                        );
+                        match resubscribe_log_tail(&connection, &table_path, num_buckets, is_partitioned).await {
+                            Ok(new_scanner) => scanner = new_scanner,
+                            Err(e2) => yield Err(e2),
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            if batches.is_empty() {
+                // An idle poll can still complete bootstrap when the resume
+                // position was already at the tail.
+                if !is_ready && caught_up(&high_watermarks, &consumed_offsets) {
+                    is_ready = true;
+                    match cdc::build_ready_signal_envelope(&schema) {
+                        Ok(envelope) => yield Ok(envelope),
+                        Err(e) => yield Err(e.into()),
+                    }
+                }
+                continue;
+            }
+
+            for scan_batch in batches {
+                let batch = scan_batch.batch();
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+
+                let key = (
+                    scan_batch.bucket().partition_id(),
+                    scan_batch.bucket().bucket_id(),
+                );
+                consumed_offsets.insert(key, scan_batch.last_offset());
+
+                if !is_ready {
+                    is_ready = caught_up(&high_watermarks, &consumed_offsets);
+                }
+
+                metrics.add_records_consumed(batch.num_rows() as u64);
+                metrics.add_bytes_consumed(batch.get_array_memory_size() as u64);
+
+                let change_batch = match cdc::wrap_data_as_change_batch(&schema, batch) {
+                    Ok(cb) => cb,
+                    Err(e) => {
+                        yield Err(e.into());
+                        continue;
+                    }
+                };
+
+                let committer = make_committer(committer_factory.as_ref(), &consumed_offsets);
+                yield Ok(cdc::ChangeEnvelope::new(committer, change_batch, is_ready));
+            }
+        }
+    };
+
+    Ok(Box::pin(stream))
+}
+
+/// Map Fluss `ChangeType` to a Spice CDC operation code.
+///
+/// Returns `None` for `UpdateBefore`, which is skipped — the accelerator
+/// upserts by primary key, so only `UpdateAfter` is needed.
+fn change_type_to_op(ct: ChangeType) -> Option<&'static str> {
+    match ct {
+        ChangeType::AppendOnly | ChangeType::Insert => Some("c"),
+        ChangeType::UpdateAfter => Some("u"),
+        ChangeType::Delete => Some("d"),
+        ChangeType::UpdateBefore => None,
+    }
+}
+
+/// Build a `ChangeBatch` from per-record scan results with CDC operations.
+///
+/// Each record's `ChangeType` is mapped to a CDC op code, and primary key
+/// column names are attached per row. `UpdateBefore` records are filtered out.
+/// Returns `Ok(None)` when every record was filtered.
+fn build_cdc_change_batch(
+    records: &[fluss::record::ScanRecord],
+    table_schema: &SchemaRef,
+    primary_keys: &[String],
+) -> Result<Option<ChangeBatch>, cdc::StreamError> {
+    let valid_records: Vec<_> = records
+        .iter()
+        .filter_map(|r| change_type_to_op(*r.change_type()).map(|op| (op, r)))
+        .collect();
+
+    if valid_records.is_empty() {
+        return Ok(None);
+    }
+
+    let num_rows = valid_records.len();
+    let changes_schema = cdc::changes_schema(table_schema.as_ref());
+
+    // 1) op column
+    let ops: Vec<&str> = valid_records.iter().map(|(op, _)| *op).collect();
+    let op_array: ArrayRef = Arc::new(StringArray::from(ops));
+
+    // 2) primary_keys column — the same key names for every row
+    let pk_array: ArrayRef = if primary_keys.is_empty() {
+        let offsets = vec![0i32; num_rows + 1];
+        let values = Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
+        Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, false)),
+            OffsetBuffer::new(offsets.into()),
+            values,
+            None,
+        ))
+    } else {
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        let mut pk_values = Vec::new();
+        for _ in 0..num_rows {
+            offsets.push(i32::try_from(pk_values.len()).unwrap_or(i32::MAX));
+            for key in primary_keys {
+                pk_values.push(key.as_str());
+            }
+        }
+        offsets.push(i32::try_from(pk_values.len()).unwrap_or(i32::MAX));
+        let values = Arc::new(StringArray::from(pk_values)) as ArrayRef;
+        Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, false)),
+            OffsetBuffer::new(offsets.into()),
+            values,
+            None,
+        ))
+    };
+
+    // 3) data column — slice each record's single row out of its underlying
+    //    batch and concatenate.
+    let mut row_batches: Vec<RecordBatch> = Vec::with_capacity(num_rows);
+    for (_, record) in &valid_records {
+        let columnar_row = record.row();
+        let Some(batch) = columnar_row.get_record_batch() else {
+            return Err(cdc::StreamError::External(
+                "Fluss scan record carries no Arrow batch (non-columnar row)".to_string(),
+            ));
+        };
+        row_batches.push(batch.slice(columnar_row.get_row_id(), 1));
+    }
+
+    let combined_batch = arrow::compute::concat_batches(table_schema, &row_batches)
+        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
+
+    let data_array: ArrayRef = Arc::new(StructArray::new(
+        combined_batch.schema().fields().clone(),
+        combined_batch.columns().to_vec(),
+        None,
+    ));
+
+    let record_batch = RecordBatch::try_new(
+        Arc::new(changes_schema),
+        vec![op_array, pk_array, data_array],
+    )
+    .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
+
+    ChangeBatch::try_new(record_batch)
+        .map(Some)
+        .map_err(cdc::StreamError::from)
+}
+
+/// Create a `ChangesStream` that subscribes to the changelog of a Fluss
+/// primary-key (KV) table and emits CDC operations:
+/// `Insert`/`AppendOnly` → "c", `UpdateAfter` → "u", `Delete` → "d",
+/// `UpdateBefore` → skipped.
+///
+/// Bootstrap replays the changelog from `EARLIEST_OFFSET` (no checkpoint) and
+/// converges to current state via PK upserts; this requires the table's
+/// changelog retention (`table.log.ttl`) to cover its history. Resume uses the
+/// per-bucket offsets persisted by the envelope committers.
+#[expect(clippy::implicit_hasher)]
+pub async fn stream_cdc_table(
+    connection: Arc<FlussConnection>,
+    table_path: TablePath,
+    metrics: Arc<FlussMetrics>,
+    initial_offsets: Option<HashMap<OffsetKey, i64>>,
+    committer_factory: Option<CommitterFactory>,
+) -> Result<ChangesStream, cdc::StreamError> {
+    let table = connection.get_table(&table_path).await.map_err(fluss_err)?;
+    let table_info = table.get_table_info();
+    let schema: SchemaRef = fluss::record::to_arrow_schema(table_info.row_type())
+        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
+
+    let primary_keys: Vec<String> = table_info.primary_keys.clone();
+
+    let num_buckets = table_info.get_num_buckets();
+    let is_partitioned = table_info.is_partitioned();
+
+    let (high_watermarks, bucket_offsets, partition_bucket_offsets) = prepare_subscription(
+        &connection,
+        &table_path,
+        num_buckets,
+        is_partitioned,
+        initial_offsets.as_ref(),
+    )
+    .await?;
+
+    let mut scanner = table.new_scan().create_log_scanner().map_err(fluss_err)?;
+    // `table` borrows `connection`, which moves into the generator below.
+    drop(table);
+
+    if is_partitioned {
+        scanner
+            .subscribe_partition_buckets(&partition_bucket_offsets)
+            .await
+            .map_err(fluss_err)?;
+    } else {
+        scanner
+            .subscribe_buckets(&bucket_offsets)
+            .await
+            .map_err(fluss_err)?;
+    }
+
+    let mut consumed_offsets = seed_consumed(initial_offsets.as_ref());
+    let starts_ready = caught_up(&high_watermarks, &consumed_offsets);
+
+    let stream = stream! {
+        let mut is_ready = starts_ready;
+
+        // Same up-front readiness announcement as the log path: an idle
+        // resume or empty table must not leave the dataset NotReady.
+        if is_ready {
+            match cdc::build_ready_signal_envelope(&schema) {
+                Ok(envelope) => yield Ok(envelope),
+                Err(e) => yield Err(e.into()),
+            }
+        }
+
+        loop {
+            let scan_records = match scanner.poll(POLL_TIMEOUT).await {
+                Ok(records) => records,
+                Err(e) => {
+                    metrics.inc_poll_errors();
+                    let out_of_range = is_offset_out_of_range(&e);
+                    yield Err(fluss_err(e));
+                    tokio::time::sleep(ERROR_BACKOFF).await;
+                    if out_of_range {
+                        tracing::warn!(
+                            table = %table_path,
+                            "Fluss changelog segments were truncated past the checkpoint; replaying from EARLIEST — PK upserts/deletes converge the accelerated table"
+                        );
+                        match resubscribe_cdc_earliest(&connection, &table_path, num_buckets, is_partitioned).await {
+                            Ok(new_scanner) => {
+                                scanner = new_scanner;
+                                // Checkpoints restart from the replay position.
+                                consumed_offsets.clear();
+                            }
+                            Err(e2) => yield Err(e2),
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            if scan_records.is_empty() {
+                if !is_ready && caught_up(&high_watermarks, &consumed_offsets) {
+                    is_ready = true;
+                    tracing::info!("Fluss CDC bootstrap complete (caught up to high watermarks)");
+                    match cdc::build_ready_signal_envelope(&schema) {
+                        Ok(envelope) => yield Ok(envelope),
+                        Err(e) => yield Err(e.into()),
+                    }
+                }
+                continue;
+            }
+
+            // Advance per-bucket offsets from the records themselves, then
+            // collect all records across buckets into one change batch.
+            let records_by_bucket = scan_records.into_records_by_buckets();
+            let mut all_records = Vec::new();
+            for (bucket, records) in records_by_bucket {
+                if let Some(last) = records.last() {
+                    consumed_offsets.insert(
+                        (bucket.partition_id(), bucket.bucket_id()),
+                        last.offset(),
+                    );
+                }
+                all_records.extend(records);
+            }
+
+            if all_records.is_empty() {
+                continue;
+            }
+
+            if !is_ready {
+                is_ready = caught_up(&high_watermarks, &consumed_offsets);
+            }
+
+            metrics.add_records_consumed(all_records.len() as u64);
+
+            match build_cdc_change_batch(&all_records, &schema, &primary_keys) {
+                Ok(Some(change_batch)) => {
+                    let committer = make_committer(committer_factory.as_ref(), &consumed_offsets);
+                    yield Ok(cdc::ChangeEnvelope::new(committer, change_batch, is_ready));
+                }
+                Ok(None) => {
+                    // All records were UpdateBefore — nothing to emit, but the
+                    // offsets still advanced; they ride on the next envelope.
+                }
+                Err(e) => {
+                    yield Err(e);
+                }
+            }
+        }
+    };
+
+    Ok(Box::pin(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::Schema;
+    use data_components::cdc::ChangeOperation;
+    use fluss::metadata::RowType;
+    use fluss::record::ScanRecord;
+    use fluss::row::ColumnarRow;
+
+    fn wm(entries: &[(OffsetKey, i64)]) -> HashMap<OffsetKey, i64> {
+        entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn caught_up_when_no_watermarks() {
+        assert!(caught_up(&HashMap::new(), &HashMap::new()));
+    }
+
+    #[test]
+    fn caught_up_empty_buckets_are_ready_without_consumption() {
+        let watermarks = wm(&[((None, 0), 0), ((None, 1), 0)]);
+        assert!(caught_up(&watermarks, &HashMap::new()));
+    }
+
+    #[test]
+    fn caught_up_requires_consumption_to_watermark_minus_one() {
+        let watermarks = wm(&[((None, 0), 5)]);
+        assert!(!caught_up(&watermarks, &HashMap::new()));
+        assert!(!caught_up(&watermarks, &wm(&[((None, 0), 3)])));
+        // last consumed offset is inclusive; watermark is exclusive
+        assert!(caught_up(&watermarks, &wm(&[((None, 0), 4)])));
+    }
+
+    #[test]
+    fn caught_up_partitioned_keys_tracked_independently() {
+        let watermarks = wm(&[((Some(7), 0), 2), ((Some(8), 0), 2)]);
+        let consumed = wm(&[((Some(7), 0), 1)]);
+        assert!(!caught_up(&watermarks, &consumed));
+        let consumed = wm(&[((Some(7), 0), 1), ((Some(8), 0), 1)]);
+        assert!(caught_up(&watermarks, &consumed));
+    }
+
+    #[test]
+    fn change_type_mapping_skips_update_before() {
+        assert_eq!(change_type_to_op(ChangeType::AppendOnly), Some("c"));
+        assert_eq!(change_type_to_op(ChangeType::Insert), Some("c"));
+        assert_eq!(change_type_to_op(ChangeType::UpdateAfter), Some("u"));
+        assert_eq!(change_type_to_op(ChangeType::Delete), Some("d"));
+        assert_eq!(change_type_to_op(ChangeType::UpdateBefore), None);
+    }
+
+    fn test_batch() -> (SchemaRef, Arc<RecordBatch>) {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["alice", "bob"])),
+            ],
+        )
+        .expect("test batch");
+        (schema, Arc::new(batch))
+    }
+
+    fn scan_record(
+        batch: &Arc<RecordBatch>,
+        row_id: usize,
+        offset: i64,
+        ct: ChangeType,
+    ) -> ScanRecord {
+        let row = ColumnarRow::new(
+            Arc::clone(batch),
+            Arc::new(RowType::new(vec![])),
+            row_id,
+            None,
+        )
+        .expect("columnar row");
+        ScanRecord::new(row, offset, 0, ct)
+    }
+
+    #[test]
+    fn cdc_change_batch_maps_ops_and_filters_update_before() {
+        let (schema, batch) = test_batch();
+        let records = vec![
+            scan_record(&batch, 0, 10, ChangeType::Insert),
+            scan_record(&batch, 0, 11, ChangeType::UpdateBefore),
+            scan_record(&batch, 1, 12, ChangeType::UpdateAfter),
+            scan_record(&batch, 1, 13, ChangeType::Delete),
+        ];
+        let pks = vec!["user_id".to_string()];
+
+        let change_batch = build_cdc_change_batch(&records, &schema, &pks)
+            .expect("build")
+            .expect("non-empty");
+
+        // UpdateBefore filtered: 4 records -> 3 rows.
+        assert_eq!(change_batch.data_batch().num_rows(), 3);
+        assert!(matches!(change_batch.op(0), ChangeOperation::Create));
+        assert!(matches!(change_batch.op(1), ChangeOperation::Update));
+        assert!(matches!(change_batch.op(2), ChangeOperation::Delete));
+        for row in 0..3 {
+            assert_eq!(change_batch.primary_keys(row), vec!["user_id".to_string()]);
+        }
+    }
+
+    #[test]
+    fn cdc_change_batch_all_update_before_is_none() {
+        let (schema, batch) = test_batch();
+        let records = vec![scan_record(&batch, 0, 10, ChangeType::UpdateBefore)];
+        let result = build_cdc_change_batch(&records, &schema, &[]).expect("build");
+        assert!(result.is_none());
+    }
+}
